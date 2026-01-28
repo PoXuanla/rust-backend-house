@@ -1,0 +1,9 @@
+[package]
+name = "rust-backend-house"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.7"        # 後端框架
+tokio = { version = "1.0", features = ["full"] } # 非同步執行環境
+serde = { version = "1.0", features = ["derive"] } # 資料序列化 (JSON)
