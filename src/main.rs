@@ -10,16 +10,15 @@ use axum::{
     Router,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
-use models::{ChatPayload, Message as ChatMessage, ProConfig};
+use models::{Message as ChatMessage};
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 // 1. 定義共享狀態
 struct AppState {
     // 廣播頻道：所有訊息都會經過這裡
     tx: broadcast::Sender<ChatMessage>,
 }
-
 #[tokio::main]
 async fn main() {
     let (tx, _rx) = broadcast::channel(100);
@@ -41,64 +40,72 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
-    let (sender, mut receiver) = socket.split();
+    // 拿到 ws 發送器跟接收器
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+    // 啟用 broadcast 發送器
+    let mut broadcast_rx = state.tx.subscribe();
+    // 建立多對一處理器
+    let (tx_out, mut rx_out) = mpsc::unbounded_channel::<Message>();
+    // mpsc 發送一筆消息
+    let _ = tx_out.send(Message::Text("歡迎連線".to_string()));
 
-    let sender = Arc::new(Mutex::new(sender));
+    
+    // mpsc 接收到資料，將資料透過 ws 發送器發出去
+    let mut send_task = tokio::spawn(async move {
+        while let Some(msg) = rx_out.recv().await {
+            if ws_sender.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
 
-    let mut rx: broadcast::Receiver<ChatMessage> = state.tx.subscribe();
-
-    let _ = sender
-        .lock()
-        .await
-        .send(Message::Text("歡迎連線".to_string()))
-        .await;
-
-    let sender_clone = Arc::clone(&sender);
-    let mut send_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
-        while let Ok(chat_msg) = rx.recv().await {
-            if let Ok(json) = serde_json::to_string(&chat_msg) {
-                if sender_clone
-                    .lock()
-                    .await
-                    .send(Message::Text(json))
-                    .await
-                    .is_err()
-                {
+    //廣播收到的內容同步給 mpsc
+    let tx_out_clone = tx_out.clone();
+    let mut broadcast_task = tokio::spawn(async move {
+        while let Ok(chat_msg) = broadcast_rx.recv().await {
+            if let Ok(json) = serde_json::to_string(&chat_msg){
+                if tx_out_clone.send(Message::Text(json)).is_err(){
                     break;
                 }
             }
         }
     });
 
-    let tx = state.tx.clone();
-    let sender_clone = Arc::clone(&sender);
+    let broadcast_tx = state.tx.clone();
     let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(Message::Text(text))) = receiver.next().await {
-            println!("📥 收到消息: {}", text); // 调试日志
-            match serde_json::from_str::<ChatMessage>(&text) {
-                Ok(chat_msg) => {
-                    println!("✅ 解析成功，广播消息"); // 调试日志
-                    let _ = tx.send(chat_msg);
-                }
-                Err(e) => {
-                    println!("❌ 解析失败: {}", e); // 调试日志
-                    let error_msg =
-                        ChatMessage::System("格式錯誤：請發送正確的 JSON 格式".to_string());
-                    if let Ok(json) = serde_json::to_string(&error_msg) {
-                        println!("📤 发送错误消息: {}", json); // 调试日志
-                        match sender_clone.lock().await.send(Message::Text(json)).await {
-                            Ok(_) => println!("✅ 错误消息发送成功"),
-                            Err(e) => println!("❌ 错误消息发送失败: {}", e),
-                        }
-                    }
+       while let Some(Ok(Message::Text(text))) = ws_receiver.next().await {
+        println!("📥 收到消息: {}", text);
+        match serde_json::from_str::<ChatMessage>(&text){
+            Ok(chat_msg) => {
+              println!("✅ 解析成功，广播消息");
+              let _ = broadcast_tx.send(chat_msg);
+            }
+            Err(e) => {
+                println!("❌ 解析失败: {}", e);
+                let error_msg = ChatMessage::System("格式錯誤".to_string());
+                if let Ok(json_msg) = serde_json::to_string(&error_msg) {
+                    println!("📤 发送错误消息: {}", &json_msg);
+                    let _ = tx_out.send(Message::Text(json_msg));
                 }
             }
         }
+       } 
     });
+    
 
     // 如果其中一個任務結束（例如使用者關掉視窗），就停止另一個任務
     tokio::select! {
-        _ = (&mut send_task) => recv_task.abort(),
-        _ = (&mut recv_task) => send_task.abort(),
+        _ = (&mut send_task) => {
+            recv_task.abort();
+            broadcast_task.abort();
+        }
+        _ = (&mut recv_task) => {
+            send_task.abort();
+            broadcast_task.abort();
+        }
+        _ = (&mut broadcast_task) => {
+            send_task.abort();
+            recv_task.abort();
+        }
     };
 }
